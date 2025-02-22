@@ -3,6 +3,11 @@ pub use crate::weights::{Lang, LANGUAGES};
 #[allow(clippy::all)]
 mod weights;
 
+use std::arch::is_x86_feature_detected;
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
 const NUM_LANGUAGES: usize = LANGUAGES.len();
 
 #[doc(hidden)]
@@ -37,88 +42,167 @@ fn murmurhash2(mut k: u32, seed: u32) -> u32 {
 impl Feature {
     #[inline(always)]
     pub fn to_hash(&self) -> u32 {
-        match self {
-            Feature::AsciiNGram(ngram) => murmurhash2(*ngram, SEED),
-            Feature::Unicode(chr) => murmurhash2(*chr as u32 / 128, SEED ^ 2),
-            Feature::UnicodeClass(chr) => murmurhash2(classify_codepoint(*chr), SEED ^ 4),
+        match *self {
+            Feature::AsciiNGram(ngram) => murmurhash2(ngram, SEED),
+            Feature::Unicode(chr) => murmurhash2((chr as u32) >> 7, SEED ^ 2),
+            Feature::UnicodeClass(chr) => murmurhash2(classify_codepoint(chr), SEED ^ 4),
         }
+    }
+}
+
+#[inline(always)]
+fn update_scores(scores: &mut [f32], weight: &[f32]) {
+    if is_x86_feature_detected!("avx2") && scores.len() >= 8 {
+        unsafe { update_scores_avx2(scores, weight) }
+    } else {
+        for (s, &w) in scores.iter_mut().zip(weight) {
+            *s += w;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn update_scores_avx2(scores: &mut [f32], weight: &[f32]) {
+    let len = scores.len();
+    let mut i = 0;
+    while i + 8 <= len {
+        let s_ptr = scores.as_mut_ptr().add(i);
+        let w_ptr = weight.as_ptr().add(i);
+        let s_vec = _mm256_loadu_ps(s_ptr);
+        let w_vec = _mm256_loadu_ps(w_ptr);
+        let sum_vec = _mm256_add_ps(s_vec, w_vec);
+        _mm256_storeu_ps(s_ptr, sum_vec);
+        i += 8;
+    }
+    for j in i..len {
+        scores[j] += weight[j];
+    }
+}
+
+#[inline(always)]
+fn apply_transform(scores: &mut [f32], intercepts: &[f32], sqrt_inv: f32) {
+    if is_x86_feature_detected!("avx2") && scores.len() >= 8 {
+        unsafe { apply_transform_avx2(scores, intercepts, sqrt_inv) }
+    } else {
+        for (s, &i) in scores.iter_mut().zip(intercepts) {
+            *s = *s * sqrt_inv + i;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn apply_transform_avx2(scores: &mut [f32], intercepts: &[f32], sqrt_inv: f32) {
+    let len = scores.len();
+    let sqrt_inv_vec = _mm256_set1_ps(sqrt_inv);
+    let mut i = 0;
+    while i + 8 <= len {
+        let s_ptr = scores.as_mut_ptr().add(i);
+        let i_ptr = intercepts.as_ptr().add(i);
+        let s_vec = _mm256_loadu_ps(s_ptr);
+        let i_vec = _mm256_loadu_ps(i_ptr);
+        let res_vec = _mm256_fmadd_ps(s_vec, sqrt_inv_vec, i_vec);
+        _mm256_storeu_ps(s_ptr, res_vec);
+        i += 8;
+    }
+    for j in i..len {
+        scores[j] = scores[j] * sqrt_inv + intercepts[j];
     }
 }
 
 pub fn detect_language(text: &str) -> Lang {
     let mut scores: [f32; NUM_LANGUAGES] = Default::default();
     let mut num_features: u32 = 0;
-    emit_tokens(
-        text,
-        #[inline(always)]
-        |token| {
-            num_features += 1u32;
-            let bucket = token.to_hash() % DIMENSION as u32;
-            let idx = bucket as usize * NUM_LANGUAGES;
-            let per_language_scores = &weights::WEIGHTS[idx..idx + NUM_LANGUAGES];
-            for i in 0..NUM_LANGUAGES {
-                scores[i] += per_language_scores[i];
-            }
-        },
-    );
+    emit_tokens(text, |token| {
+        num_features += 1;
+        let bucket = token.to_hash() % DIMENSION as u32;
+        let idx = bucket as usize * NUM_LANGUAGES;
+        let weight_slice = &weights::WEIGHTS[idx..idx + NUM_LANGUAGES];
+        update_scores(&mut scores, weight_slice);
+    });
     if num_features == 0 {
         // By default, we return English
         return Lang::Eng;
     }
-
-    let sqrt_inv_num_features = 1.0f32 / (num_features as f32).sqrt();
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..NUM_LANGUAGES {
-        // Ok so the sqrt(num_features) is not really the norm, but whatever.
-        scores[i] = scores[i] * sqrt_inv_num_features + weights::INTERCEPTS[i];
-    }
-
-    let lang_id = scores
+    let sqrt_inv = 1.0 / (num_features as f32).sqrt();
+    apply_transform(&mut scores, &weights::INTERCEPTS, sqrt_inv);
+    let (lang_id, _) = scores
         .iter()
         .enumerate()
-        .max_by(|(_, &score_left), (_, &score_right)| score_left.partial_cmp(&score_right).unwrap())
-        .map(|(pos, _val)| pos)
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
         .unwrap();
     weights::LANGUAGES[lang_id]
 }
 
 #[doc(hidden)]
 pub fn emit_tokens(text: &str, mut listener: impl FnMut(Feature)) {
-    let mut prev = ' ' as u32;
-    let mut num_previous_ascii_chr = 1;
-    for chr in text.chars() {
-        let code = chr.to_ascii_lowercase() as u32;
-        if !chr.is_ascii() {
-            listener(Feature::Unicode(chr));
-            listener(Feature::UnicodeClass(chr));
-            num_previous_ascii_chr = 0;
-            continue;
-        }
-        prev = prev << 8 | code;
-        match num_previous_ascii_chr {
-            0 => {
-                num_previous_ascii_chr = 1;
+    if text.is_ascii() {
+        let bytes = text.as_bytes();
+        let mut prev = b' ' as u32;
+        let mut num_prev_ascii = 1;
+        for &b in bytes {
+            let code = (b as char).to_ascii_lowercase() as u32;
+            prev = (prev << 8) | code;
+            match num_prev_ascii {
+                0 => {
+                    num_prev_ascii = 1;
+                }
+                1 => {
+                    listener(Feature::AsciiNGram(prev & BIGRAM_MASK));
+                    num_prev_ascii = 2;
+                }
+                2 => {
+                    listener(Feature::AsciiNGram(prev & BIGRAM_MASK));
+                    listener(Feature::AsciiNGram(prev & TRIGRAM_MASK));
+                    num_prev_ascii = 3;
+                }
+                3 => {
+                    listener(Feature::AsciiNGram(prev & BIGRAM_MASK));
+                    listener(Feature::AsciiNGram(prev & TRIGRAM_MASK));
+                    listener(Feature::AsciiNGram(prev));
+                }
+                _ => unreachable!(),
             }
-            1 => {
-                listener(Feature::AsciiNGram(prev & BIGRAM_MASK));
-                num_previous_ascii_chr = 2;
-            }
-            2 => {
-                listener(Feature::AsciiNGram(prev & BIGRAM_MASK));
-                listener(Feature::AsciiNGram(prev & TRIGRAM_MASK));
-                num_previous_ascii_chr = 3;
-            }
-            3 => {
-                listener(Feature::AsciiNGram(prev & BIGRAM_MASK));
-                listener(Feature::AsciiNGram(prev & TRIGRAM_MASK));
-                listener(Feature::AsciiNGram(prev));
-            }
-            _ => {
-                unreachable!();
+            if !(b as char).is_alphanumeric() {
+                prev = ' ' as u32;
             }
         }
-        if !chr.is_alphanumeric() {
-            prev = ' ' as u32;
+    } else {
+        let mut prev = ' ' as u32;
+        let mut num_prev_ascii = 1;
+        for chr in text.chars() {
+            if !chr.is_ascii() {
+                listener(Feature::Unicode(chr));
+                listener(Feature::UnicodeClass(chr));
+                num_prev_ascii = 0;
+            } else {
+                let code = chr.to_ascii_lowercase() as u32;
+                prev = prev << 8 | code;
+                match num_prev_ascii {
+                    0 => {
+                        num_prev_ascii = 1;
+                    }
+                    1 => {
+                        listener(Feature::AsciiNGram(prev & BIGRAM_MASK));
+                        num_prev_ascii = 2;
+                    }
+                    2 => {
+                        listener(Feature::AsciiNGram(prev & BIGRAM_MASK));
+                        listener(Feature::AsciiNGram(prev & TRIGRAM_MASK));
+                        num_prev_ascii = 3;
+                    }
+                    3 => {
+                        listener(Feature::AsciiNGram(prev & BIGRAM_MASK));
+                        listener(Feature::AsciiNGram(prev & TRIGRAM_MASK));
+                        listener(Feature::AsciiNGram(prev));
+                    }
+                    _ => unreachable!(),
+                }
+                if !chr.is_alphanumeric() {
+                    prev = ' ' as u32;
+                }
+            }
         }
     }
 }
@@ -195,15 +279,10 @@ fn classify_codepoint(chr: char) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use crate::detect_language;
-    use crate::emit_tokens;
-    use crate::Feature;
-    use crate::Lang;
+    use crate::{detect_language, emit_tokens, Feature, Lang};
 
     fn ascii_ngram_feature(text: &str) -> Feature {
-        assert!(text.is_ascii());
-        let mut bytes: [u8; 4] = [0u8; 4];
-        assert!(text.len() <= 4);
+        let mut bytes = [0; 4];
         bytes[4 - text.len()..].copy_from_slice(text.as_bytes());
         Feature::AsciiNGram(u32::from_be_bytes(bytes))
     }
@@ -213,8 +292,8 @@ mod tests {
         let mut tokens = Vec::new();
         emit_tokens("hello　こん！", |token| tokens.push(token));
         assert_eq!(
-            &tokens,
-            &[
+            tokens,
+            vec![
                 ascii_ngram_feature(" h"),
                 ascii_ngram_feature("he"),
                 ascii_ngram_feature(" he"),
