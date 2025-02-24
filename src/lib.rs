@@ -3,8 +3,6 @@ pub use crate::weights::{Lang, LANGUAGES};
 #[allow(clippy::all)]
 mod weights;
 
-use std::arch::is_x86_feature_detected;
-
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
@@ -52,62 +50,74 @@ impl Feature {
 
 #[inline(always)]
 fn update_scores(scores: &mut [f32], weight: &[f32]) {
-    if is_x86_feature_detected!("avx2") && scores.len() >= 8 {
-        unsafe { update_scores_avx2(scores, weight) }
-    } else {
-        for (s, &w) in scores.iter_mut().zip(weight) {
-            *s += w;
-        }
-    }
+    unsafe { update_scores_avx2(scores, weight) }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn update_scores_avx2(scores: &mut [f32], weight: &[f32]) {
     let len = scores.len();
-    let mut i = 0;
-    while i + 8 <= len {
-        let s_ptr = scores.as_mut_ptr().add(i);
-        let w_ptr = weight.as_ptr().add(i);
+    let chunks = len / 8;
+    let remainder = len % 8;
+    for i in 0..chunks {
+        let offset = i * 8;
+        let s_ptr = scores.as_mut_ptr().add(offset);
+        let w_ptr = weight.as_ptr().add(offset);
         let s_vec = _mm256_loadu_ps(s_ptr);
         let w_vec = _mm256_loadu_ps(w_ptr);
         let sum_vec = _mm256_add_ps(s_vec, w_vec);
         _mm256_storeu_ps(s_ptr, sum_vec);
-        i += 8;
     }
-    for j in i..len {
-        scores[j] += weight[j];
+    if remainder > 0 {
+        let offset = chunks * 8;
+        let mut mask_arr = [0i32; 8];
+        for j in 0..remainder {
+            mask_arr[j] = -1;
+        }
+        let mask = _mm256_loadu_si256(mask_arr.as_ptr() as *const __m256i);
+        let s_ptr = scores.as_mut_ptr().add(offset);
+        let w_ptr = weight.as_ptr().add(offset);
+        let s_vec = _mm256_maskload_ps(s_ptr, mask);
+        let w_vec = _mm256_maskload_ps(w_ptr, mask);
+        let sum_vec = _mm256_add_ps(s_vec, w_vec);
+        _mm256_maskstore_ps(s_ptr, mask, sum_vec);
     }
 }
 
 #[inline(always)]
 fn apply_transform(scores: &mut [f32], intercepts: &[f32], sqrt_inv: f32) {
-    if is_x86_feature_detected!("avx2") && scores.len() >= 8 {
-        unsafe { apply_transform_avx2(scores, intercepts, sqrt_inv) }
-    } else {
-        for (s, &i) in scores.iter_mut().zip(intercepts) {
-            *s = *s * sqrt_inv + i;
-        }
-    }
+    unsafe { apply_transform_avx2(scores, intercepts, sqrt_inv) }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn apply_transform_avx2(scores: &mut [f32], intercepts: &[f32], sqrt_inv: f32) {
     let len = scores.len();
+    let chunks = len / 8;
+    let remainder = len % 8;
     let sqrt_inv_vec = _mm256_set1_ps(sqrt_inv);
-    let mut i = 0;
-    while i + 8 <= len {
-        let s_ptr = scores.as_mut_ptr().add(i);
-        let i_ptr = intercepts.as_ptr().add(i);
+    for i in 0..chunks {
+        let offset = i * 8;
+        let s_ptr = scores.as_mut_ptr().add(offset);
+        let i_ptr = intercepts.as_ptr().add(offset);
         let s_vec = _mm256_loadu_ps(s_ptr);
         let i_vec = _mm256_loadu_ps(i_ptr);
         let res_vec = _mm256_fmadd_ps(s_vec, sqrt_inv_vec, i_vec);
         _mm256_storeu_ps(s_ptr, res_vec);
-        i += 8;
     }
-    for j in i..len {
-        scores[j] = scores[j] * sqrt_inv + intercepts[j];
+    if remainder > 0 {
+        let offset = chunks * 8;
+        let mut mask_arr = [0i32; 8];
+        for j in 0..remainder {
+            mask_arr[j] = -1;
+        }
+        let mask = _mm256_loadu_si256(mask_arr.as_ptr() as *const __m256i);
+        let s_ptr = scores.as_mut_ptr().add(offset);
+        let i_ptr = intercepts.as_ptr().add(offset);
+        let s_vec = _mm256_maskload_ps(s_ptr, mask);
+        let i_vec = _mm256_maskload_ps(i_ptr, mask);
+        let res_vec = _mm256_fmadd_ps(s_vec, sqrt_inv_vec, i_vec);
+        _mm256_maskstore_ps(s_ptr, mask, res_vec);
     }
 }
 
