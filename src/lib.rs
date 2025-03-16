@@ -1,13 +1,13 @@
+#![feature(portable_simd)]
+
+use std::simd::Simd;
+
 pub use crate::weights::{Lang, LANGUAGES};
 
 #[allow(clippy::all)]
 mod weights;
 
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
-
 const NUM_LANGUAGES: usize = LANGUAGES.len();
-
 #[doc(hidden)]
 pub const DIMENSION: usize = 1 << 12;
 const BIGRAM_MASK: u32 = (1 << 16) - 1;
@@ -48,76 +48,43 @@ impl Feature {
     }
 }
 
+/// Number of elements in a SIMD vector (8 elements for f32)
+const CHUNK_SIZE: usize = 8;
+
 #[inline(always)]
 fn update_scores(scores: &mut [f32], weight: &[f32]) {
-    unsafe { update_scores_avx2(scores, weight) }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn update_scores_avx2(scores: &mut [f32], weight: &[f32]) {
-    let len = scores.len();
-    let chunks = len / 8;
-    let remainder = len % 8;
-    for i in 0..chunks {
-        let offset = i * 8;
-        let s_ptr = scores.as_mut_ptr().add(offset);
-        let w_ptr = weight.as_ptr().add(offset);
-        let s_vec = _mm256_loadu_ps(s_ptr);
-        let w_vec = _mm256_loadu_ps(w_ptr);
-        let sum_vec = _mm256_add_ps(s_vec, w_vec);
-        _mm256_storeu_ps(s_ptr, sum_vec);
+    let total_len = scores.len();
+    let mut chunks = scores.chunks_exact_mut(CHUNK_SIZE);
+    let weight_chunks = weight.chunks_exact(CHUNK_SIZE);
+    for (score_chunk, weight_chunk) in chunks.by_ref().zip(weight_chunks) {
+        let s = Simd::<f32, CHUNK_SIZE>::from_slice(score_chunk);
+        let w = Simd::<f32, CHUNK_SIZE>::from_slice(weight_chunk);
+        let res = s + w;
+        score_chunk.copy_from_slice(&res.to_array());
     }
-    if remainder > 0 {
-        let offset = chunks * 8;
-        let mut mask_arr = [0i32; 8];
-        for j in 0..remainder {
-            mask_arr[j] = -1;
-        }
-        let mask = _mm256_loadu_si256(mask_arr.as_ptr() as *const __m256i);
-        let s_ptr = scores.as_mut_ptr().add(offset);
-        let w_ptr = weight.as_ptr().add(offset);
-        let s_vec = _mm256_maskload_ps(s_ptr, mask);
-        let w_vec = _mm256_maskload_ps(w_ptr, mask);
-        let sum_vec = _mm256_add_ps(s_vec, w_vec);
-        _mm256_maskstore_ps(s_ptr, mask, sum_vec);
+    let remainder = chunks.into_remainder();
+    let weight_remainder = &weight[total_len - remainder.len()..];
+    for (score, w) in remainder.iter_mut().zip(weight_remainder) {
+        *score += *w;
     }
 }
 
 #[inline(always)]
 fn apply_transform(scores: &mut [f32], intercepts: &[f32], sqrt_inv: f32) {
-    unsafe { apply_transform_avx2(scores, intercepts, sqrt_inv) }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn apply_transform_avx2(scores: &mut [f32], intercepts: &[f32], sqrt_inv: f32) {
-    let len = scores.len();
-    let chunks = len / 8;
-    let remainder = len % 8;
-    let sqrt_inv_vec = _mm256_set1_ps(sqrt_inv);
-    for i in 0..chunks {
-        let offset = i * 8;
-        let s_ptr = scores.as_mut_ptr().add(offset);
-        let i_ptr = intercepts.as_ptr().add(offset);
-        let s_vec = _mm256_loadu_ps(s_ptr);
-        let i_vec = _mm256_loadu_ps(i_ptr);
-        let res_vec = _mm256_fmadd_ps(s_vec, sqrt_inv_vec, i_vec);
-        _mm256_storeu_ps(s_ptr, res_vec);
+    let sqrt_inv_simd = Simd::<f32, CHUNK_SIZE>::splat(sqrt_inv);
+    let total_len = scores.len();
+    let mut chunks = scores.chunks_exact_mut(CHUNK_SIZE);
+    let intercept_chunks = intercepts.chunks_exact(CHUNK_SIZE);
+    for (score_chunk, inter_chunk) in chunks.by_ref().zip(intercept_chunks) {
+        let s = Simd::<f32, CHUNK_SIZE>::from_slice(score_chunk);
+        let inter = Simd::<f32, CHUNK_SIZE>::from_slice(inter_chunk);
+        let res = s * sqrt_inv_simd + inter;
+        score_chunk.copy_from_slice(&res.to_array());
     }
-    if remainder > 0 {
-        let offset = chunks * 8;
-        let mut mask_arr = [0i32; 8];
-        for j in 0..remainder {
-            mask_arr[j] = -1;
-        }
-        let mask = _mm256_loadu_si256(mask_arr.as_ptr() as *const __m256i);
-        let s_ptr = scores.as_mut_ptr().add(offset);
-        let i_ptr = intercepts.as_ptr().add(offset);
-        let s_vec = _mm256_maskload_ps(s_ptr, mask);
-        let i_vec = _mm256_maskload_ps(i_ptr, mask);
-        let res_vec = _mm256_fmadd_ps(s_vec, sqrt_inv_vec, i_vec);
-        _mm256_maskstore_ps(s_ptr, mask, res_vec);
+    let remainder = chunks.into_remainder();
+    let intercept_remainder = &intercepts[total_len - remainder.len()..];
+    for (score, inter) in remainder.iter_mut().zip(intercept_remainder) {
+        *score = *score * sqrt_inv + *inter;
     }
 }
 
@@ -132,7 +99,6 @@ pub fn detect_language(text: &str) -> Lang {
         update_scores(&mut scores, weight_slice);
     });
     if num_features == 0 {
-        // By default, we return English
         return Lang::Eng;
     }
     let sqrt_inv = 1.0 / (num_features as f32).sqrt();
@@ -155,9 +121,7 @@ pub fn emit_tokens(text: &str, mut listener: impl FnMut(Feature)) {
             let code = (b as char).to_ascii_lowercase() as u32;
             prev = (prev << 8) | code;
             match num_prev_ascii {
-                0 => {
-                    num_prev_ascii = 1;
-                }
+                0 => num_prev_ascii = 1,
                 1 => {
                     listener(Feature::AsciiNGram(prev & BIGRAM_MASK));
                     num_prev_ascii = 2;
@@ -190,9 +154,7 @@ pub fn emit_tokens(text: &str, mut listener: impl FnMut(Feature)) {
                 let code = chr.to_ascii_lowercase() as u32;
                 prev = prev << 8 | code;
                 match num_prev_ascii {
-                    0 => {
-                        num_prev_ascii = 1;
-                    }
+                    0 => num_prev_ascii = 1,
                     1 => {
                         listener(Feature::AsciiNGram(prev & BIGRAM_MASK));
                         num_prev_ascii = 2;
@@ -228,6 +190,7 @@ const CJK_KANJI_END: u32 = 0x9faf;
 const JP_HALFWIDTH_KATAKANA_START: u32 = 0xff61;
 const JP_HALFWIDTH_KATAKANA_END: u32 = 0xff90;
 
+#[inline(always)]
 fn classify_codepoint(chr: char) -> u32 {
     [
         160,
