@@ -1,6 +1,6 @@
 #![feature(portable_simd)]
 
-use std::simd::{Simd, StdFloat}; // Changed from SimdFloat to StdFloat
+use std::simd::{Simd, StdFloat};
 
 pub use crate::weights::{Lang, LANGUAGES};
 
@@ -11,7 +11,7 @@ const NUM_LANGUAGES: usize = LANGUAGES.len();
 pub const DIMENSION: usize = 1 << 12;
 const BIGRAM_MASK: u32 = (1 << 16) - 1;
 const TRIGRAM_MASK: u32 = (1 << 24) - 1;
-const CHUNK_SIZE: usize = 16; // Increased SIMD width
+const CHUNK_SIZE: usize = 16;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Feature {
@@ -57,18 +57,8 @@ fn update_scores(scores: &mut [f32], weight: &[f32]) {
         (s + w).copy_to_slice(&mut scores[i..]);
     }
 
-    // Process remaining elements with manual loop unrolling
-    let mut i = simd_len;
-    while i + 3 < scores.len() {
+    for i in simd_len..scores.len() {
         scores[i] += weight[i];
-        scores[i+1] += weight[i+1];
-        scores[i+2] += weight[i+2];
-        scores[i+3] += weight[i+3];
-        i += 4;
-    }
-    while i < scores.len() {
-        scores[i] += weight[i];
-        i += 1;
     }
 }
 
@@ -83,7 +73,6 @@ fn apply_transform(scores: &mut [f32], intercepts: &[f32], sqrt_inv: f32) {
         s.mul_add(sqrt_inv_simd, inter).copy_to_slice(&mut scores[i..]);
     }
 
-    // Process remaining elements with FMA
     for i in simd_len..scores.len() {
         scores[i] = scores[i].mul_add(sqrt_inv, intercepts[i]);
     }
@@ -100,10 +89,7 @@ pub fn detect_language(text: &str) -> Lang {
     emit_tokens(text, |token| {
         num_features += 1;
         let idx = (token.to_hash() as usize % DIMENSION) * NUM_LANGUAGES;
-        update_scores(
-            &mut scores, 
-            &weights::WEIGHTS[idx..idx + NUM_LANGUAGES]
-        );
+        update_scores(&mut scores, &weights::WEIGHTS[idx..idx + NUM_LANGUAGES]);
     });
     
     if num_features == 0 {
@@ -117,13 +103,40 @@ pub fn detect_language(text: &str) -> Lang {
         sqrt_inv
     );
     
-    // Find max using SIMD-friendly reduction
     let mut max_idx = 0;
     let mut max_val = scores[0];
-    for i in 1..scores.len() {
-        if scores[i] > max_val {
-            max_val = scores[i];
+    let mut i = 1;
+    
+    while i + 3 < scores.len() {
+        let s0 = scores[i];
+        let s1 = scores[i + 1];
+        let s2 = scores[i + 2];
+        let s3 = scores[i + 3];
+        
+        if s0 > max_val {
+            max_val = s0;
             max_idx = i;
+        }
+        if s1 > max_val {
+            max_val = s1;
+            max_idx = i + 1;
+        }
+        if s2 > max_val {
+            max_val = s2;
+            max_idx = i + 2;
+        }
+        if s3 > max_val {
+            max_val = s3;
+            max_idx = i + 3;
+        }
+        
+        i += 4;
+    }
+    
+    for j in i..scores.len() {
+        if scores[j] > max_val {
+            max_val = scores[j];
+            max_idx = j;
         }
     }
     
@@ -183,23 +196,22 @@ fn process_mixed_text(text: &str, listener: &mut impl FnMut(Feature)) {
 /// Process ASCII character n-grams
 #[inline(always)]
 fn process_ascii_char(prev: u32, num_prev_ascii: &mut u8, listener: &mut impl FnMut(Feature)) {
-    match *num_prev_ascii {
-        0 => *num_prev_ascii = 1,
-        1 => {
-            listener(Feature::AsciiNGram(prev & BIGRAM_MASK));
-            *num_prev_ascii = 2;
-        }
-        2 => {
-            listener(Feature::AsciiNGram(prev & BIGRAM_MASK));
-            listener(Feature::AsciiNGram(prev & TRIGRAM_MASK));
-            *num_prev_ascii = 3;
-        }
-        _ => {
-            listener(Feature::AsciiNGram(prev & BIGRAM_MASK));
-            listener(Feature::AsciiNGram(prev & TRIGRAM_MASK));
-            listener(Feature::AsciiNGram(prev));
-        }
+    if *num_prev_ascii == 0 {
+        *num_prev_ascii = 1;
+        return;
     }
+    
+    listener(Feature::AsciiNGram(prev & BIGRAM_MASK));
+    
+    if *num_prev_ascii >= 2 {
+        listener(Feature::AsciiNGram(prev & TRIGRAM_MASK));
+    }
+    
+    if *num_prev_ascii >= 3 {
+        listener(Feature::AsciiNGram(prev));
+    }
+    
+    *num_prev_ascii = (*num_prev_ascii).saturating_add(1);
 }
 
 // Japanese and Chinese character ranges
