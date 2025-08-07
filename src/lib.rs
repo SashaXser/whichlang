@@ -50,15 +50,20 @@ impl Feature {
 #[inline(always)]
 fn update_scores(scores: &mut [f32], weight: &[f32]) {
     let simd_len = scores.len() - (scores.len() % CHUNK_SIZE);
-    
-    for i in (0..simd_len).step_by(CHUNK_SIZE) {
-        let s: Simd<f32, CHUNK_SIZE> = Simd::from_slice(&scores[i..]);
-        let w: Simd<f32, CHUNK_SIZE> = Simd::from_slice(&weight[i..]);
-        (s + w).copy_to_slice(&mut scores[i..]);
+    let (scores_head, scores_tail) = scores.split_at_mut(simd_len);
+    let (weight_head, weight_tail) = weight.split_at(simd_len);
+
+    for (s_chunk, w_chunk) in scores_head
+        .chunks_exact_mut(CHUNK_SIZE)
+        .zip(weight_head.chunks_exact(CHUNK_SIZE))
+    {
+        let s: Simd<f32, CHUNK_SIZE> = Simd::from_slice(s_chunk);
+        let w: Simd<f32, CHUNK_SIZE> = Simd::from_slice(w_chunk);
+        (s + w).copy_to_slice(s_chunk);
     }
 
-    for i in simd_len..scores.len() {
-        scores[i] += weight[i];
+    for i in 0..scores_tail.len() {
+        scores_tail[i] += weight_tail[i];
     }
 }
 
@@ -66,15 +71,20 @@ fn update_scores(scores: &mut [f32], weight: &[f32]) {
 fn apply_transform(scores: &mut [f32], intercepts: &[f32], sqrt_inv: f32) {
     let sqrt_inv_simd: Simd<f32, CHUNK_SIZE> = Simd::splat(sqrt_inv);
     let simd_len = scores.len() - (scores.len() % CHUNK_SIZE);
+    let (scores_head, scores_tail) = scores.split_at_mut(simd_len);
+    let (inter_head, inter_tail) = intercepts.split_at(simd_len);
 
-    for i in (0..simd_len).step_by(CHUNK_SIZE) {
-        let s: Simd<f32, CHUNK_SIZE> = Simd::from_slice(&scores[i..]);
-        let inter: Simd<f32, CHUNK_SIZE> = Simd::from_slice(&intercepts[i..]);
-        s.mul_add(sqrt_inv_simd, inter).copy_to_slice(&mut scores[i..]);
+    for (s_chunk, inter_chunk) in scores_head
+        .chunks_exact_mut(CHUNK_SIZE)
+        .zip(inter_head.chunks_exact(CHUNK_SIZE))
+    {
+        let s: Simd<f32, CHUNK_SIZE> = Simd::from_slice(s_chunk);
+        let inter: Simd<f32, CHUNK_SIZE> = Simd::from_slice(inter_chunk);
+        s.mul_add(sqrt_inv_simd, inter).copy_to_slice(s_chunk);
     }
 
-    for i in simd_len..scores.len() {
-        scores[i] = scores[i].mul_add(sqrt_inv, intercepts[i]);
+    for i in 0..scores_tail.len() {
+        scores_tail[i] = scores_tail[i].mul_add(sqrt_inv, inter_tail[i]);
     }
 }
 
@@ -88,7 +98,8 @@ pub fn detect_language(text: &str) -> Lang {
     
     emit_tokens(text, |token| {
         num_features += 1;
-        let idx = (token.to_hash() as usize % DIMENSION) * NUM_LANGUAGES;
+        let bucket = (token.to_hash() as usize) & (DIMENSION - 1);
+        let idx = bucket * NUM_LANGUAGES;
         update_scores(&mut scores, &weights::WEIGHTS[idx..idx + NUM_LANGUAGES]);
     });
     
@@ -153,6 +164,17 @@ pub fn emit_tokens(text: &str, mut listener: impl FnMut(Feature)) {
     }
 }
 
+// Fast ASCII helpers to avoid Unicode-heavy operations in hot loops
+#[inline(always)]
+fn ascii_lower(b: u8) -> u8 {
+    if (b'A'..=b'Z').contains(&b) { b + 32 } else { b }
+}
+
+#[inline(always)]
+fn is_ascii_alnum(b: u8) -> bool {
+    (b'0'..=b'9').contains(&b) || (b'a'..=b'z').contains(&b) || (b'A'..=b'Z').contains(&b)
+}
+
 /// Process ASCII-only text for n-grams
 #[inline(always)]
 fn process_ascii_text(bytes: &[u8], listener: &mut impl FnMut(Feature)) {
@@ -160,10 +182,10 @@ fn process_ascii_text(bytes: &[u8], listener: &mut impl FnMut(Feature)) {
     let mut num_prev_ascii = 1;
     
     for &b in bytes {
-        let code = (b as char).to_ascii_lowercase() as u32;
-        prev = (prev << 8) | code;
+        let lower = ascii_lower(b) as u32;
+        prev = (prev << 8) | lower;
         process_ascii_char(prev, &mut num_prev_ascii, listener);
-        if !(b as char).is_alphanumeric() {
+        if !is_ascii_alnum(b) {
             prev = b' ' as u32;
             num_prev_ascii = 1;
         }
@@ -182,10 +204,11 @@ fn process_mixed_text(text: &str, listener: &mut impl FnMut(Feature)) {
             listener(Feature::UnicodeClass(chr));
             num_prev_ascii = 0;
         } else {
-            let code = chr.to_ascii_lowercase() as u32;
-            prev = (prev << 8) | code;
+            let b = chr as u8;
+            let lower = ascii_lower(b) as u32;
+            prev = (prev << 8) | lower;
             process_ascii_char(prev, &mut num_prev_ascii, listener);
-            if !chr.is_alphanumeric() {
+            if !is_ascii_alnum(b) {
                 prev = b' ' as u32;
                 num_prev_ascii = 1;
             }

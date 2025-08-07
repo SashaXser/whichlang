@@ -36,7 +36,8 @@ fn main() -> io::Result<()> {
         }
         let sentence: &str = id_label_sentence[2];
         emit_tokens(sentence, |token| {
-            features[token.to_hash() as usize % DIMENSION] += 1;
+            let bucket = (token.to_hash() as usize) & (DIMENSION - 1);
+            features[bucket] += 1;
         });
         write!(
             &mut stdoutlock,
