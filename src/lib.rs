@@ -1,6 +1,6 @@
 #![feature(portable_simd)]
 
-use std::simd::{Simd, StdFloat};
+use std::simd::Simd;
 
 pub use crate::weights::{Lang, LANGUAGES};
 
@@ -8,10 +8,10 @@ pub use crate::weights::{Lang, LANGUAGES};
 mod weights;
 
 const NUM_LANGUAGES: usize = LANGUAGES.len();
+type ScoreSimd = Simd<f32, NUM_LANGUAGES>;
 pub const DIMENSION: usize = 1 << 12;
 const BIGRAM_MASK: u32 = (1 << 16) - 1;
 const TRIGRAM_MASK: u32 = (1 << 24) - 1;
-const CHUNK_SIZE: usize = 16;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Feature {
@@ -47,49 +47,19 @@ impl Feature {
     }
 }
 
-#[inline(always)]
-fn update_scores(scores: &mut [f32], weight: &[f32]) {
-    let simd_len = scores.len() - (scores.len() % CHUNK_SIZE);
-    
-    for i in (0..simd_len).step_by(CHUNK_SIZE) {
-        let s: Simd<f32, CHUNK_SIZE> = Simd::from_slice(&scores[i..]);
-        let w: Simd<f32, CHUNK_SIZE> = Simd::from_slice(&weight[i..]);
-        (s + w).copy_to_slice(&mut scores[i..]);
-    }
-
-    for i in simd_len..scores.len() {
-        scores[i] += weight[i];
-    }
-}
-
-#[inline(always)]
-fn apply_transform(scores: &mut [f32], intercepts: &[f32], sqrt_inv: f32) {
-    let sqrt_inv_simd: Simd<f32, CHUNK_SIZE> = Simd::splat(sqrt_inv);
-    let simd_len = scores.len() - (scores.len() % CHUNK_SIZE);
-
-    for i in (0..simd_len).step_by(CHUNK_SIZE) {
-        let s: Simd<f32, CHUNK_SIZE> = Simd::from_slice(&scores[i..]);
-        let inter: Simd<f32, CHUNK_SIZE> = Simd::from_slice(&intercepts[i..]);
-        s.mul_add(sqrt_inv_simd, inter).copy_to_slice(&mut scores[i..]);
-    }
-
-    for i in simd_len..scores.len() {
-        scores[i] = scores[i].mul_add(sqrt_inv, intercepts[i]);
-    }
-}
-
 pub fn detect_language(text: &str) -> Lang {
     if text.is_empty() {
         return Lang::Eng;
     }
 
-    let mut scores = [0.0; NUM_LANGUAGES];
+    let mut scores = ScoreSimd::splat(0.0);
     let mut num_features = 0u32;
     
     emit_tokens(text, |token| {
         num_features += 1;
         let idx = (token.to_hash() as usize % DIMENSION) * NUM_LANGUAGES;
-        update_scores(&mut scores, &weights::WEIGHTS[idx..idx + NUM_LANGUAGES]);
+        let weight = ScoreSimd::from_slice(&weights::WEIGHTS[idx..idx + NUM_LANGUAGES]);
+        scores += weight;
     });
     
     if num_features == 0 {
@@ -97,14 +67,14 @@ pub fn detect_language(text: &str) -> Lang {
     }
     
     let sqrt_inv = (num_features as f32).sqrt().recip();
-    apply_transform(
-        &mut scores, 
-        &weights::INTERCEPTS[..NUM_LANGUAGES], 
-        sqrt_inv
-    );
+    let intercepts = ScoreSimd::from_slice(&weights::INTERCEPTS[..NUM_LANGUAGES]);
+    scores *= ScoreSimd::splat(sqrt_inv);
+    scores += intercepts;
     
+    let scores = scores.to_array();
     let mut max_idx = 0;
     let mut max_val = scores[0];
+    
     let mut i = 1;
     
     while i + 3 < scores.len() {
